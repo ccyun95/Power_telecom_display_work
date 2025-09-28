@@ -2,8 +2,8 @@ name: KRX Daily Data Collector
 
 on:
   schedule:
-    # 매일 18:10 KST == 09:10 UTC (월~금)
-    - cron: "10 9 * * 1-5"
+    # 매일 18:20 KST == 09:20 UTC (월~금)
+    - cron: "20 9 * * 1-5"
   workflow_dispatch:
     inputs:
       run_on_holiday:
