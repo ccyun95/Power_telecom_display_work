@@ -1,22 +1,23 @@
 import argparse
 import logging
 import os
+import json
 from pathlib import Path
 from datetime import datetime, timedelta
 from dateutil import tz
 import time
 import pandas as pd
-
 from pykrx import stock
 
-# ============================================================
+# =========================
 # 설정
-# ============================================================
+# =========================
 DATA_DIR = Path(os.getenv("GITHUB_WORKSPACE", ".")) / "data"
 OUTPUT_SUFFIX = "_stock_data.csv"
 ENCODING = "utf-8-sig"     # 엑셀 호환
-SLEEP_SEC = 0.3            # API 과도 호출 방지
-WINDOW_DAYS_INIT = 370     # 신규 생성시 과거 1년+α
+SLEEP_SEC = 0.3            # API 과호출 방지
+WINDOW_DAYS_INIT = 370     # 신규 생성 시 과거 1년+α
+BACKFILL_CAL_DAYS_FOR_SHORT = 10  # 공매도잔고/비중 지연 공개 보정용 최소 재수집 구간(캘린더 일수)
 
 REQ_COLS = [
     "일자","시가","고가","저가","종가","거래량","등락률",
@@ -26,17 +27,13 @@ REQ_COLS = [
 
 KST = tz.gettz("Asia/Seoul")
 
-
-# ============================================================
-# 로거 설정 (pykrx 잘못된 logging 호출 묵음 처리)
-# ============================================================
+# pykrx 내부 로그 묵음
 for name in ["pykrx", "pykrx.website", "pykrx.website.comm", "pykrx.website.comm.util"]:
     logging.getLogger(name).disabled = True
 
-
-# ============================================================
-# 유틸 함수
-# ============================================================
+# =========================
+# 유틸
+# =========================
 def kst_today_date():
     return datetime.now(tz=KST).date()
 
@@ -44,14 +41,9 @@ def yyyymmdd(d):
     return d.strftime("%Y%m%d")
 
 def empty_with_cols(cols):
-    """지정한 컬럼을 가진 '빈 DF'를 반환합니다(merge 키 보장)."""
     data = {}
     for c in cols:
-        # '일자'는 문자열로, 나머지는 float 기본
-        if c == "일자":
-            data[c] = pd.Series(dtype="object")
-        else:
-            data[c] = pd.Series(dtype="float64")
+        data[c] = pd.Series(dtype="object") if c == "일자" else pd.Series(dtype="float64")
     return pd.DataFrame(data)
 
 def read_company_list(path: Path):
@@ -71,23 +63,20 @@ def read_company_list(path: Path):
                     logging.warning("기업 라인 파싱 불가: %s", line)
                     continue
                 name, ticker = parts[0], parts[1]
-            ticker = ticker.zfill(6)
-            rows.append((name, ticker))
+            rows.append((name, ticker.zfill(6)))
     return rows
 
-def last_trading_day_by_ohlcv(ticker: str, today: datetime.date):
-    """최근 구간의 마지막 거래일을 OHLCV로 판정"""
+def last_trading_day_by_ohlcv(ticker: str, today):
     start = today - timedelta(days=30)
     df = stock.get_market_ohlcv(yyyymmdd(start), yyyymmdd(today), ticker)
     if df is None or df.empty:
         start = today - timedelta(days=90)
         df = stock.get_market_ohlcv(yyyymmdd(start), yyyymmdd(today), ticker)
     if df is None or df.empty:
-        raise RuntimeError(f"{ticker} : 최근 거래 자료가 없습니다.")
+        raise RuntimeError(f"{ticker}: 최근 거래 자료 없음")
     return pd.to_datetime(df.index.max()).date()
 
 def normalize_date_index(df: pd.DataFrame) -> pd.DataFrame:
-    """pykrx 데이터프레임을 '일자' 컬럼(YYYY-MM-DD)으로 정규화. 빈 DF여도 '일자' 보장."""
     if df is None or df.empty:
         return empty_with_cols(["일자"])
     df = df.copy()
@@ -100,150 +89,322 @@ def normalize_date_index(df: pd.DataFrame) -> pd.DataFrame:
     df["일자"] = pd.to_datetime(df["일자"], errors="coerce").dt.strftime("%Y-%m-%d")
     return df
 
+def _normalize_date_col(df: pd.DataFrame) -> pd.DataFrame:
+    """CSV/수집 데이터 모두 '일자'를 YYYY-MM-DD 문자열로 표준화."""
+    if df is None or df.empty or "일자" not in df.columns:
+        return df
+    df = df.copy()
+    df["일자"] = pd.to_datetime(df["일자"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
 def rename_investor_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """투자자별 거래실적 컬럼 표준화(빈 DF 안전)."""
     if df is None or df.empty or "일자" not in df.columns:
         return empty_with_cols(["일자","기관 합계","기타법인","개인","외국인 합계","전체"])
     mapping = {
-        "기관합계": "기관 합계",
-        "외국인합계": "외국인 합계",
-        "전체": "전체",
-        "개인": "개인",
-        "기타법인": "기타법인",
-        "기관 합계": "기관 합계",
-        "외국인 합계": "외국인 합계",
+        "기관합계":"기관 합계", "외국인합계":"외국인 합계",
+        "기관 합계":"기관 합계", "외국인 합계":"외국인 합계",
+        "개인":"개인", "기타법인":"기타법인", "전체":"전체"
     }
     df = df.rename(columns={c: mapping.get(c, c) for c in df.columns})
     for need in ["기관 합계","기타법인","개인","외국인 합계","전체"]:
         if need not in df.columns:
             df[need] = 0
-    keep = ["일자","기관 합계","기타법인","개인","외국인 합계","전체"]
-    return df[keep]
+    return df[["일자","기관 합계","기타법인","개인","외국인 합계","전체"]]
 
 def rename_short_cols(df: pd.DataFrame, is_balance=False) -> pd.DataFrame:
-    """
-    공매도 거래량/비중 또는 잔고/비중을 표준 컬럼으로 정리.
-    입력 df는 normalize_date_index를 거쳐 '일자'가 항상 존재(빈 DF 가능).
-    """
     if df is None or df.empty or "일자" not in df.columns:
-        return empty_with_cols(["일자"] + (["공매도잔고","공매도잔고비중"] if is_balance else ["공매도","공매도비중"]))
+        base = ["공매도잔고","공매도잔고비중"] if is_balance else ["공매도","공매도비중"]
+        return empty_with_cols(["일자"] + base)
     dfc = df.copy()
-
     if is_balance:
-        amt = next((c for c in dfc.columns if any(k in c for k in ["공매도잔고","잔고","BAL_QTY"])), None)
-        rto = next((c for c in dfc.columns if any(k in c for k in ["공매도잔고비중","잔고비중","BAL_RTO"])), None)
+        amt = next((c for c in dfc.columns if any(k in c for c2 in ["공매도잔고","잔고","BAL_QTY"] for k in [c2])), None)
+        rto = next((c for c in dfc.columns if any(k in c for c2 in ["공매도잔고비중","잔고비중","BAL_RTO"] for k in [c2])), None)
         dfc["공매도잔고"] = pd.to_numeric(dfc[amt], errors="coerce") if amt else 0
         dfc["공매도잔고비중"] = pd.to_numeric(dfc[rto], errors="coerce") if rto else 0.0
         keep = ["일자","공매도잔고","공매도잔고비중"]
-        return dfc[keep]
     else:
         amt = next((c for c in dfc.columns if any(k in c for k in ["공매도","공매도거래량","거래량"])), None)
         rto = next((c for c in dfc.columns if any(k in c for k in ["공매도비중","비중"])), None)
         dfc["공매도"] = pd.to_numeric(dfc[amt], errors="coerce") if amt else 0
         dfc["공매도비중"] = pd.to_numeric(dfc[rto], errors="coerce") if rto else 0.0
         keep = ["일자","공매도","공매도비중"]
-        return dfc[keep]
+    return dfc[keep]
 
 def ensure_all_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """최종 스키마(REQ_COLS)를 강제합니다."""
     for col in REQ_COLS:
         if col not in df.columns:
             df[col] = 0
-    # 컬럼 순서 고정
     return df[REQ_COLS]
 
-def fetch_block(ticker: str, start_d: datetime.date, end_d: datetime.date) -> pd.DataFrame:
-    s, e = yyyymmdd(start_d), yyyymmdd(end_d)
+# ---------- CSV 파일명 규칙: <이름>_<6자리티커>_stock_data.csv ----------
+def csv_path_for(eng_name: str, ticker: str) -> Path:
+    return DATA_DIR / f"{eng_name}_{str(ticker).zfill(6)}{OUTPUT_SUFFIX}"
 
-    # 1) OHLCV
+def fetch_block(ticker: str, start_d, end_d) -> pd.DataFrame:
+    s, e = yyyymmdd(start_d), yyyymmdd(end_d)
     ohlcv = stock.get_market_ohlcv(s, e, ticker)
     df1 = normalize_date_index(ohlcv)
 
-    # 2) 투자자별 거래실적
     inv = stock.get_market_trading_volume_by_date(s, e, ticker)
     df2 = rename_investor_cols(normalize_date_index(inv))
 
-    # 3) 공매도 거래량/비중 (예외 안전)
     try:
         sv = stock.get_shorting_volume_by_date(s, e, ticker)
     except Exception:
         sv = pd.DataFrame()
     df3 = rename_short_cols(normalize_date_index(sv), is_balance=False)
 
-    # 4) 공매도 잔고/비중 (예외 안전) ← 문제 발생 지점
     try:
         sb = stock.get_shorting_balance_by_date(s, e, ticker)
     except Exception:
         sb = pd.DataFrame()
     df4 = rename_short_cols(normalize_date_index(sb), is_balance=True)
 
-    # 안전 머지 (모두 '일자' 보유)
     df = df1.merge(df2, on="일자", how="left") \
             .merge(df3, on="일자", how="left") \
             .merge(df4, on="일자", how="left")
-
-    # 스키마/형 변환/정렬
     df = ensure_all_cols(df)
     for c in [c for c in df.columns if c != "일자"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    df = df.sort_values("일자", ascending=False)
+    return df.sort_values("일자", ascending=False)
+
+# =========================
+# (신규) T·T-1의 공매도잔고/비중을 T-2 값으로 덮어쓰기
+# =========================
+def propagate_short_balance_from_t2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    최신 내림차순 정렬 기준으로,
+    - 2행(2거래일 전)의 '공매도잔고/공매도잔고비중' 값을 읽어,
+    - 0행(현거래일), 1행(전일)의 두 컬럼을 동일 값으로 덮어쓴다.
+    - 2거래일 전 데이터가 없으면(행<3) 변경하지 않음.
+    """
+    cols = ["공매도잔고", "공매도잔고비중"]
+    if df is None or df.empty or not all(c in df.columns for c in cols):
+        return df
+    df = df.copy()
+    # 최신 우선 정렬 보장
+    try:
+        df["__dt__"] = pd.to_datetime(df["일자"], errors="coerce")
+        df.sort_values("__dt__", ascending=False, inplace=True)
+        df.drop(columns="__dt__", inplace=True)
+    except Exception:
+        df.sort_values("일자", ascending=False, inplace=True)
+
+    if len(df) >= 3:
+        ref = df.iloc[2][cols].values  # 2거래일 전 값
+        for idx in [0, 1]:
+            df.iloc[idx, df.columns.get_indexer(cols)] = ref
     return df
 
+# =========================
+# 회사별 업데이트
+# =========================
 def upsert_company(eng_name: str, ticker: str, run_on_holiday: bool):
-    out_path = DATA_DIR / f"{eng_name}{OUTPUT_SUFFIX}"
-
+    out_path = csv_path_for(eng_name, ticker)
     today = kst_today_date()
     end_date = last_trading_day_by_ohlcv(ticker, today)
 
+    # ---- 백필 윈도우 적용: 최근 N일 + last_have - 2일까지 후퇴 ----
     if out_path.exists():
         base = pd.read_csv(out_path, encoding=ENCODING)
-        if base.empty:
-            last_have = None
-        else:
-            base["일자"] = pd.to_datetime(base["일자"], errors="coerce").dt.date
-            last_have = base["일자"].max()
-        start_date = (last_have + timedelta(days=1)) if last_have else (end_date - timedelta(days=WINDOW_DAYS_INIT))
+        base = _normalize_date_col(base)
+        last_have = None if base.empty else pd.to_datetime(base["일자"], errors="coerce").dt.date.max()
+
+        start_date_base = (last_have + timedelta(days=1)) if last_have else (end_date - timedelta(days=WINDOW_DAYS_INIT))
+        backfill_floor = end_date - timedelta(days=BACKFILL_CAL_DAYS_FOR_SHORT)
+        if last_have:
+            conservative_floor = last_have - timedelta(days=2)
+            backfill_floor = min(backfill_floor, conservative_floor)
+
+        start_date = min(start_date_base, backfill_floor)
     else:
         start_date = end_date - timedelta(days=WINDOW_DAYS_INIT)
 
-    # 휴장일이며 run_on_holiday=False이고 신규라면 스킵
     if (end_date < today) and (not run_on_holiday) and (not out_path.exists()):
-        logging.info("[%s] 휴장일(run_on_holiday=False) → 신규 생성 건 스킵", eng_name)
+        logging.info("[%s] 휴장일(run_on_holiday=False) → 신규 생성 스킵", eng_name)
         return False
 
     if start_date > end_date:
-        logging.info("[%s] 최신 상태 (추가할 데이터 없음).", eng_name)
+        logging.info("[%s] 최신 상태 (추가 데이터 없음)", eng_name)
         return False
 
-    logging.info("[%s] 수집 구간: %s ~ %s (티커 %s)", eng_name, start_date, end_date, ticker)
+    logging.info("[%s] 재수집 구간: %s ~ %s (티커 %s)", eng_name, start_date, end_date, ticker)
     df = fetch_block(ticker, start_date, end_date)
+    df = _normalize_date_col(df)
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
         base = pd.read_csv(out_path, encoding=ENCODING)
+        base = _normalize_date_col(base)
+
+        # 병합: base(우선순위 낮음) + df(우선순위 높음)
+        base["__pri__"] = 0
+        df["__pri__"] = 1
         merged = pd.concat([base, df], ignore_index=True)
-        merged.drop_duplicates(subset=["일자"], keep="last", inplace=True)
-        merged = merged.sort_values("일자", ascending=False)
-        merged.to_csv(out_path, index=False, encoding=ENCODING, lineterminator="\r\n")
-        logging.info("[%s] 업데이트 완료 → %s", eng_name, out_path)
+
+        # 최신→과거, 같은 일자는 __pri__가 높은(df) 값이 먼저 오도록
+        merged["__dt__"] = pd.to_datetime(merged["일자"], errors="coerce")
+        merged.sort_values(["__dt__", "__pri__"], ascending=[False, False], inplace=True, kind="mergesort")
+
+        # 동일 '일자' 중복 제거: 첫 행(=가장 최신 & df 우선)이 남게
+        merged.drop_duplicates(subset=["일자"], keep="first", inplace=True)
+        merged.drop(columns=["__dt__", "__pri__"], inplace=True)
+        merged.reset_index(drop=True, inplace=True)
+
+        # T·T-1 ← T-2 값 덮어쓰기
+        merged = propagate_short_balance_from_t2(merged)
+
+        # 최종 정렬 및 저장
+        merged["__dt__"] = pd.to_datetime(merged["일자"], errors="coerce")
+        merged.sort_values("__dt__", ascending=False, inplace=True)
+        merged.drop(columns="__dt__", inplace=True)
+        merged.to_csv(out_path, index=False, encoding=ENCODING, lineterminator="\n")
+        logging.info("[%s] 업데이트 → %s (총 %d행)", eng_name, out_path, len(merged))
     else:
-        df.to_csv(out_path, index=False, encoding=ENCODING, lineterminator="\r\n")
-        logging.info("[%s] 신규 생성 완료 → %s", eng_name, out_path)
+        df = propagate_short_balance_from_t2(df)
+        df.to_csv(out_path, index=False, encoding=ENCODING, lineterminator="\n")
+        logging.info("[%s] 신규 생성 → %s (총 %d행)", eng_name, out_path, len(df))
     return True
 
+# =========================
+# 기업별 JSON + index.html 생성
+#  - 단일 index.json 생성 없음
+# =========================
+def emit_per_ticker_json(companies, rows_limit=None):
+    api_dir = Path(os.getenv("GITHUB_WORKSPACE", ".")) / "docs" / "api"
+    api_dir.mkdir(parents=True, exist_ok=True)
+    cnt = 0
+    for name, ticker in companies:
+        csv_path = csv_path_for(name, ticker)
+        if not csv_path.exists():
+            continue
+        try:
+            df = pd.read_csv(csv_path, encoding=ENCODING)
+        except Exception:
+            df = pd.read_csv(csv_path)
+        if df.empty:
+            continue
+        if rows_limit:
+            df = df.head(int(rows_limit))
 
-# ============================================================
+        item = {
+            "name": name,
+            "ticker": str(ticker).zfill(6),
+            "columns": [str(c) for c in df.columns],
+            "rows": df.astype(str).values.tolist(),
+            "row_count": int(len(df)),
+        }
+        out = api_dir / f"{name}_{str(ticker).zfill(6)}.json"
+        out.write_text(json.dumps(item, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        cnt += 1
+    logging.info("기업별 JSON 생성: %d개", cnt)
+
+def emit_index_html(companies, rows_limit=None):
+    import html as _html
+    docs_dir = Path(os.getenv("GITHUB_WORKSPACE", ".")) / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    sections = []
+    generated = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    for name, ticker in companies:
+        csv_path = csv_path_for(name, ticker)
+        if not csv_path.exists():
+            continue
+        try:
+            df = pd.read_csv(csv_path, encoding=ENCODING)
+        except Exception:
+            df = pd.read_csv(csv_path)
+        if df.empty:
+            continue
+        if rows_limit:
+            df = df.head(int(rows_limit))
+
+        columns = [str(c) for c in df.columns]
+        rows = df.astype(str).values.tolist()
+
+        thead = "".join(f"<th>{_html.escape(c)}</th>" for c in columns)
+        tbody = "\n".join(
+            "<tr>" + "".join(f"<td>{_html.escape(v)}</td>" for v in row) + "</tr>" for row in rows
+        )
+        sec_id = f"{name}_{str(ticker).zfill(6)}"
+        sections.append(f"""
+<section id="{_html.escape(sec_id)}">
+  <h2>{_html.escape(name)} ({str(ticker).zfill(6)})</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr>{thead}</tr></thead>
+      <tbody>
+      {tbody}
+      </tbody>
+    </table>
+  </div>
+  <p class="meta">rows: {len(rows)} · source: data/{_html.escape(csv_path.name)} · json: api/{_html.escape(sec_id)}.json</p>
+</section>""")
+
+    def _id_from(sec_html: str) -> str:
+        try:
+            return sec_html.split('id="', 1)[1].split('"', 1)[0]
+        except Exception:
+            return "section"
+
+    nav = "".join(f'<a href="#{_id_from(s)}">{_id_from(s)}</a>' for s in sections)
+
+    html_doc = f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KRX 기업별 데이터 테이블</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }}
+  header {{ margin-bottom: 20px; }}
+  .meta-top {{ color:#666; font-size:14px; }}
+  .nav {{ display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:8px; }}
+  .nav a {{ font-size:13px; text-decoration:none; color:#2563eb; }}
+  section {{ margin: 32px 0; }}
+  h2 {{ font-size: 18px; margin: 12px 0; }}
+  .scroll {{ overflow:auto; max-height: 60vh; border:1px solid #e5e7eb; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+  th, td {{ border: 1px solid #e5e7eb; padding: 6px 8px; text-align: right; }}
+  th:first-child, td:first-child {{ text-align: left; white-space: nowrap; }}
+  thead th {{ position: sticky; top:0; background:#fafafa; }}
+  .meta {{ color:#666; font-size:12px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>KRX 기업별 데이터 테이블</h1>
+  <div class="meta-top">생성 시각: {generated} · 타임존: Asia/Seoul</div>
+  <nav class="nav">{nav}</nav>
+</header>
+{''.join(sections) if sections else '<p>표시할 데이터가 없습니다.</p>'}
+<footer style="margin-top:40px;color:#666;font-size:12px">
+  Published via GitHub Pages · Per-ticker JSON: /api/*.json
+</footer>
+</body>
+</html>"""
+    (docs_dir / "index.html").write_text(html_doc, encoding="utf-8")
+    logging.info("index.html 생성 완료 → %s", docs_dir / "index.html")
+
+# =========================
 # 엔트리포인트
-# ============================================================
+# =========================
 def main():
     parser = argparse.ArgumentParser(description="KRX 일별 데이터 수집 & CSV 업데이트")
     parser.add_argument("--company-list", default=str(DATA_DIR / "company_list.txt"))
-    parser.add_argument("--run-on-holiday", default="true",
-                        help="휴장일에도 실행(전 영업일 데이터 사용) (true/false)")
+    parser.add_argument("--run-on-holiday", default="true", help="휴장일에도 실행 (true/false)")
+    parser.add_argument("--rows-limit", default=os.getenv("ROWS_LIMIT", "").strip(),
+                        help="HTML/JSON 포함 최대 행 수 (빈 값이면 전량)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     run_on_holiday = str(args.run_on_holiday).lower() in ("1","true","yes","y")
+    rows_limit = None if args.rows_limit in ("", "0", "none", "None") else int(args.rows_limit)
 
     try:
         companies = read_company_list(Path(args.company_list))
@@ -265,10 +426,13 @@ def main():
             logging.exception("[%s,%s] 처리 중 오류: %s", name, ticker, e)
 
     if changed:
-        logging.info("변경사항이 있습니다. Git 커밋 단계에서 반영됩니다.")
+        logging.info("변경사항 존재 → 커밋 단계에서 반영됩니다.")
     else:
         logging.info("변경사항 없음.")
 
+    # 단일 index.json은 만들지 않음 → 기업별 JSON + index.html만 생성
+    emit_per_ticker_json(companies, rows_limit=rows_limit)
+    emit_index_html(companies, rows_limit=rows_limit)
 
 if __name__ == "__main__":
     main()
