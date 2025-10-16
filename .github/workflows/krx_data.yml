@@ -1,9 +1,9 @@
-name: KRX Daily Data Collector
+name: KRX data pipeline
 
 on:
   schedule:
-    # 매일 18:20 KST == 09:20 UTC (월~금)
-    - cron: "20 9 * * 1-5"
+    # 매일 18:15 KST == 09:10 UTC (월~금)
+    - cron: "15 9 * * 1-5"
   workflow_dispatch:
     inputs:
       run_on_holiday:
@@ -11,13 +11,19 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: write
+
+concurrency:
+  group: krx-data-pipeline
+  cancel-in-progress: false
+
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
     env:
-      RUN_ON_HOLIDAY: ${{ inputs.run_on_holiday || 'true' }}
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      ROWS_LIMIT: "180"  # index.html/기업별 JSON에 포함할 최근 N행 (전량이면 "" 또는 0)
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,23 +33,69 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Collect / Update KRX data
+      # 1) CSV 생성/업데이트 (경로 고정: src/update_stock_data.py, data/company_list.txt)
+      - name: Update CSVs from data/company_list.txt
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          python -m src.update_stock_data --run-on-holiday "${RUN_ON_HOLIDAY}"
+          set -e
+          mkdir -p data
+          if [ ! -f data/company_list.txt ]; then
+            echo "company_list.txt not found at data/company_list.txt"; exit 1
+          fi
 
+          RUN_ON_HOLIDAY="${{ github.event.inputs.run_on_holiday }}"
+          if [ -z "$RUN_ON_HOLIDAY" ]; then RUN_ON_HOLIDAY="true"; fi
+
+          python src/update_stock_data.py \
+            --company-list data/company_list.txt \
+            --run-on-holiday "$RUN_ON_HOLIDAY" \
+            --rows-limit "${ROWS_LIMIT}"
+
+      # (선택) CSV 줄바꿈 LF 표준화
+      - name: Normalize CSV line endings to LF
+        run: |
+          shopt -s nullglob
+          for f in data/*.csv; do
+            sed -i 's/\r$//' "$f"
+          done
+
+      # 헤더만(한 줄) CSV 제거
+      - name: Drop header-only CSVs (lines < 2)
+        run: |
+          shopt -s nullglob
+          for f in data/*.csv; do
+            L=$(wc -l < "$f" || echo 0)
+            echo "$f -> ${L} lines"
+            if [ "$L" -lt 2 ]; then
+              echo "::warning ::$f looks header-only; removing"
+              rm -f "$f"
+            fi
+          done
+
+      # 2) 커밋 & 푸시 (기업별 JSON + index.html 만 포함)
       - name: Commit & Push changes (if any)
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "chore(data): KRX daily update ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
-            git push
-          else
+          git add -A data docs/api/*.json docs/index.html || true
+          if git diff --cached --quiet; then
             echo "No changes to commit."
+          else
+            git commit -m "chore(pages): per-ticker JSON + index.html tables [skip ci]"
+            git push
           fi
