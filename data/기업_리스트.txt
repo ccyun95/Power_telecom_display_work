@@ -1,4 +1,5 @@
 LS ELECTRIC,LS_Electric,010120, 평균 매입가: 180875
 산일전기,Sanil_Electric,062040, 평균 매입가: 49358
-RFHIC,RFHIC,218410, 평균 매입가: 32929
+RFHIC,RFHIC,218410, 평균 매입가: 33510
 HD현대일렉트릭,HD_Hyundai_Electric,267260, 평균매입가: 767000
+비나텍,Vinatech,126340, 평균 매입가: 82750
