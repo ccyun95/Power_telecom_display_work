@@ -2,4 +2,5 @@ LS_Electric,010120
 Sanil_Electric,062040
 RFHIC,218410
 HD_Hyundai_Electric,267260
+HD_Hyundai_Energy_Solutions,322000
 Vinatech,126340
